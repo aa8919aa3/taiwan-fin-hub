@@ -168,6 +168,7 @@ import { obankConfigSchema } from "./obank";
 
 export {
   firstbankConfigSchema,
+  FirstbankProtocolError,
   parseFirstbankConfig,
   parseFirstbankData,
 } from "./firstbank";

@@ -8,6 +8,7 @@ import puppeteer, {
   type Page,
 } from "@cloudflare/puppeteer";
 import {
+  FirstbankProtocolError,
   parseFirstbankData,
   type FirstbankConfig,
   type FirstbankPayloads,
@@ -106,6 +107,7 @@ type TransactionDocumentMeta = {
 type TransactionResponseCapture = {
   armed: boolean;
   armedAt?: number;
+  queryAccount?: FirstbankPayloads["transactionQueryAccount"];
   existingResultFrames: Set<Frame>;
   html?: string;
   verificationRequested: boolean;
@@ -326,7 +328,21 @@ export function createFirstbankConnector(
 
         await ensureTraditionalChineseUi(page);
         const payloads = await collectFirstbankPayloads(page);
-        const data = parseFirstbankData(payloads);
+        let data: ReturnType<typeof parseFirstbankData>;
+        try {
+          data = parseFirstbankData(payloads);
+        } catch (error) {
+          const diagnostics =
+            error instanceof FirstbankProtocolError
+              ? error.transactionAccountDiagnostics
+              : undefined;
+          if (diagnostics) {
+            logFirstbankStage("010103-account-match-failed", {
+              detail: `accounts=${diagnostics.depositAccountCount},pageIdentity=${diagnostics.pageAccountIdentityPresent},selectedIdentity=${diagnostics.selectedAccountIdentityPresent},selectedUniqueExact=${diagnostics.selectedAccountUniqueExactMatch},strategy=${diagnostics.strategy}`,
+            });
+          }
+          throw error;
+        }
         const dataWithOptionalRecords = data as typeof data & {
           bankTransactions?: unknown[];
           creditCardBills?: unknown[];
@@ -1169,7 +1185,7 @@ async function collectFirstbankPayloads(
       page,
       depositFrame,
     );
-    const transactionHistoryHtml = await submitTransactionQuery(
+    const transactionQuery = await submitTransactionQuery(
       page,
       queryFrame,
       transactionResponse,
@@ -1180,7 +1196,8 @@ async function collectFirstbankPayloads(
 
     return {
       depositOverviewHtml,
-      transactionHistoryHtml,
+      transactionHistoryHtml: transactionQuery.html,
+      transactionQueryAccount: transactionQuery.account,
       cardBill: captured.cardBill,
       cardUnbilled: captured.cardUnbilled,
       recentPayments: captured.recentPayments,
@@ -1741,7 +1758,8 @@ async function submitTransactionQuery(
       queryFrame = accountFrame;
       continue;
     }
-    if (!(await selectQueryAccount(queryFrame))) {
+    const account = await selectQueryAccount(queryFrame);
+    if (!account) {
       const replacement = await findLiveTransactionQueryFrame(page, queryFrame);
       if (replacement && replacement !== queryFrame) {
         queryFrame = replacement;
@@ -1749,6 +1767,7 @@ async function submitTransactionQuery(
       }
       throw new FirstbankConnectionError("第一銀行交易明細查詢帳號無法選取。");
     }
+    transactionResponse.queryAccount = account;
     const clickFrame = await waitForLiveTransactionQueryFrame(
       page,
       queryFrame,
@@ -1767,9 +1786,13 @@ async function submitTransactionQuery(
   transactionResponse.armedAt = Date.now();
   logFirstbankStage("0101-query-submit", {
     path: urlPathname(TRANSACTION_URL),
+    detail: `accountOptions=${transactionResponse.queryAccount.optionCount},selectedIdentity=${/\d[\d*Xx#\-\s]{4,}\d/.test(`${transactionResponse.queryAccount.value} ${transactionResponse.queryAccount.label}`)}`,
   });
   await clickTransactionSearch(queryFrame);
-  return waitForTransactionHistory(page, transactionResponse);
+  return {
+    html: await waitForTransactionHistory(page, transactionResponse),
+    account: transactionResponse.queryAccount,
+  };
 }
 
 async function waitForTransactionHistory(
@@ -2023,53 +2046,56 @@ async function waitForQueryAccountOptions(
 
 async function selectQueryAccount(frame: Frame, dryRun = false) {
   try {
-    return Boolean(
-      await withActionTimeout(
-        frame.evaluate((shouldSelect) => {
-          type QueryAccountSelect = {
-            options: ArrayLike<{
-              selected: boolean;
-              text: string;
-              value: string;
-            }>;
-            selectedIndex: number;
+    return await withActionTimeout(
+      frame.evaluate((shouldSelect) => {
+        type QueryAccountSelect = {
+          options: ArrayLike<{
+            selected: boolean;
+            text: string;
             value: string;
-            dispatchEvent: (event: Event) => boolean;
-          };
-          const isPlaceholder = (text: string, value: string) => {
-            const normalized = text.replace(/\s+/g, "");
-            return (
-              !value.trim() ||
-              value.trim() === "0" ||
-              /請選擇|選擇帳號|pleaseselect|selectaccount|^-+$/i.test(
-                normalized,
-              )
-            );
-          };
-          const select = document.querySelector(
-            'select[name="acnt"]',
-          ) as QueryAccountSelect | null;
-          if (!select) return false;
-          const option = Array.from(select.options).find(
-            (candidate) => !isPlaceholder(candidate.text, candidate.value),
-          );
-          if (!option) return false;
-          if (!shouldSelect) return true;
-          select.value = option.value;
-          option.selected = true;
-          select.dispatchEvent(new Event("input", { bubbles: true }));
-          select.dispatchEvent(new Event("change", { bubbles: true }));
-          const selected = select.options[select.selectedIndex];
+          }>;
+          selectedIndex: number;
+          value: string;
+          dispatchEvent: (event: Event) => boolean;
+        };
+        const isPlaceholder = (text: string, value: string) => {
+          const normalized = text.replace(/\s+/g, "");
           return (
-            select.value === option.value &&
-            selected !== undefined &&
-            !isPlaceholder(selected.text, selected.value)
+            !value.trim() ||
+            value.trim() === "0" ||
+            /請選擇|選擇帳號|pleaseselect|selectaccount|^-+$/i.test(normalized)
           );
-        }, !dryRun),
-      ),
+        };
+        const select = document.querySelector(
+          'select[name="acnt"]',
+        ) as QueryAccountSelect | null;
+        if (!select) return undefined;
+        const option = Array.from(select.options).find(
+          (candidate) => !isPlaceholder(candidate.text, candidate.value),
+        );
+        if (!option) return undefined;
+        if (!shouldSelect)
+          return { optionCount: select.options.length, value: "", label: "" };
+        select.value = option.value;
+        option.selected = true;
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        const selected = select.options[select.selectedIndex];
+        if (!(
+          select.value === option.value &&
+          selected !== undefined &&
+          !isPlaceholder(selected.text, selected.value)
+        ))
+          return undefined;
+        return {
+          optionCount: select.options.length,
+          value: selected.value,
+          label: selected.text,
+        };
+      }, !dryRun),
     );
   } catch {
-    return false;
+    return undefined;
   }
 }
 

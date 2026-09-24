@@ -39,6 +39,12 @@ const depositTables = `
   </table>
 `;
 
+const multiAccountDepositTables = depositTables.replace(
+  "</table>",
+  `<tr class="ResultContent"><td>987654321098</td><td>新台幣</td><td>50,000</td></tr>
+</table>`,
+);
+
 const englishDepositTables = `
   <table>
     <tr class="ResultHeader">
@@ -175,7 +181,10 @@ function base64Text(value: string) {
 
 type Listener = (...args: unknown[]) => void;
 
-function makeFrame(options?: { authenticated?: boolean }) {
+function makeFrame(options?: {
+  authenticated?: boolean;
+  depositHtml?: string;
+}) {
   let currentUrl = options?.authenticated ? FRAME_URL : LOGIN_URL;
   return {
     detached: false,
@@ -195,7 +204,11 @@ function makeFrame(options?: { authenticated?: boolean }) {
       if (source.includes("document.readyState")) return true;
       if (source.includes("depositTriggerSelector")) return "#btnOpen a";
       if (source.includes("fetch(resourcePath")) {
-        return { ok: true, status: 200, text: depositTables };
+        return {
+          ok: true,
+          status: 200,
+          text: options?.depositHtml ?? depositTables,
+        };
       }
       if (source.includes("searchBtn") && source.includes("setTimeout")) {
         setTimeout(() => {
@@ -206,7 +219,7 @@ function makeFrame(options?: { authenticated?: boolean }) {
       if (source.includes('querySelectorAll("table")')) {
         return currentUrl.includes("010103")
           ? transactionTables
-          : depositTables;
+          : (options?.depositHtml ?? depositTables);
       }
       if (
         source.includes("acnt") ||
@@ -220,13 +233,14 @@ function makeFrame(options?: { authenticated?: boolean }) {
       if (source.includes("targetLabel")) return false;
       return undefined;
     }),
-    content: vi.fn().mockResolvedValue(depositTables),
+    content: vi.fn().mockResolvedValue(options?.depositHtml ?? depositTables),
   };
 }
 
 function makePage(options?: {
   authenticated?: boolean;
   afterLogin?: "frame" | "interstitial";
+  depositHtml?: string;
 }) {
   const afterLogin = options?.afterLogin ?? "frame";
   let currentUrl = options?.authenticated ? FRAME_URL : LOGIN_URL;
@@ -448,7 +462,7 @@ function makePage(options?: {
     if (selector === "#btnOpen a") {
       page.emitResponse(
         "https://ibank.firstbank.com.tw/NetBank/ajax/acntReview1.html",
-        depositTables,
+        options?.depositHtml ?? depositTables,
       );
     }
   });
@@ -1840,7 +1854,7 @@ describe("第一銀行交易明細 010103 擷取", () => {
     const page = makePage({ authenticated: true });
     const accountSelect = mockQueryAccountSelect(page.frame, [
       { text: "--Please select--", value: "0", selected: true },
-      { text: "masked-account", value: "24657009679" },
+      { text: "masked-account", value: "123456789012" },
     ]);
     detachQueryFrameAfterSearch(
       page,
@@ -1866,10 +1880,49 @@ describe("第一銀行交易明細 010103 擷取", () => {
         expect.objectContaining({ amount: -100, description: "測試交易" }),
       ]),
     );
-    expect(accountSelect.select.value).toBe("24657009679");
+    expect(accountSelect.select.value).toBe("123456789012");
     expect(accountSelect.options[0]?.selected).toBe(false);
     expect(accountSelect.options[1]?.selected).toBe(true);
     expect(accountSelect.dispatchEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("結果頁序列化只保留 table 時，以已選帳戶安全對應多帳戶明細", async () => {
+    const page = makePage({
+      authenticated: true,
+      depositHtml: multiAccountDepositTables,
+    });
+    mockQueryAccountSelect(page.frame, [
+      { text: "請選擇", value: "0", selected: true },
+      { text: "帳號 123456789012", value: "123456789012" },
+    ]);
+    detachQueryFrameAfterSearch(
+      page,
+      [makeEmptyLiveFrame()],
+      `<div>帳號：123456789012</div>${transactionTables}`,
+    );
+    const browser = makeBrowser(page);
+    puppeteerMock.launch.mockResolvedValue(browser);
+
+    const result = await createFirstbankConnector({} as Fetcher, vi.fn()).sync({
+      ...credentials,
+      sessionCookies: JSON.stringify([
+        {
+          name: "SESSION",
+          value: "encrypted-at-rest",
+          domain: "ibank.firstbank.com.tw",
+        },
+      ]),
+    });
+
+    expect(result.bankAccounts).toHaveLength(2);
+    expect(result.bankTransactions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          amount: -100,
+          raw: expect.objectContaining({ accountLast4: "9012" }),
+        }),
+      ]),
+    );
   });
 
   it("只有 placeholder 時不送出交易查詢", async () => {

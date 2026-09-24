@@ -145,6 +145,142 @@ const transactionsWithoutPageAccount = parseFirstbankData(
   now,
 );
 
+const multiAccountDepositOverviewHtml = depositOverviewHtml.replace(
+  "</table>",
+  `<tr class="ResultContent">
+    <td>合成分行</td><td>iLEO 帳戶</td><td>112233445566<br>另一個存款帳戶</td>
+    <td>新臺幣</td><td>6,789</td><td>6,000</td><td>-</td>
+  </tr>
+  </table>`,
+);
+const transactionHistoryWithoutPageAccount = transactionHistoryHtml.replace(
+  `<div>帳號：${accountNumber}</div>`,
+  "<div>交易明細</div>",
+);
+assert.throws(
+  () =>
+    parseFirstbankData(
+      {
+        depositOverviewHtml: multiAccountDepositOverviewHtml,
+        transactionHistoryHtml: transactionHistoryWithoutPageAccount,
+      },
+      now,
+    ),
+  FirstbankProtocolError,
+  "多個存款帳戶且結果頁未顯示帳號時，不得任意配對交易明細",
+);
+const transactionsWithSelectedQueryAccount = parseFirstbankData(
+  {
+    depositOverviewHtml: multiAccountDepositOverviewHtml,
+    transactionHistoryHtml: transactionHistoryWithoutPageAccount,
+    transactionQueryAccount: {
+      optionCount: 3,
+      value: accountNumber,
+      label: "日常存款",
+    },
+  },
+  now,
+);
+assert.equal(
+  transactionsWithSelectedQueryAccount.bankTransactions.length,
+  2,
+  "結果頁未顯示帳號時，應使用實際選定且可唯一驗證的查詢帳戶",
+);
+assert.ok(
+  transactionsWithSelectedQueryAccount.bankTransactions.every(
+    (transaction) => transaction.raw?.accountLast4 === accountNumber.slice(-4),
+  ),
+);
+for (const [value, label, history] of [
+  [accountNumber, "112233445566", transactionHistoryWithoutPageAccount],
+  ["112233445566", "", transactionHistoryHtml],
+  ["667788990011", "", transactionHistoryHtml],
+  [
+    accountNumber,
+    "",
+    transactionHistoryHtml.replace(accountNumber, "667788990011"),
+  ],
+]) {
+  assert.throws(
+    () =>
+      parseFirstbankData(
+        {
+          depositOverviewHtml: multiAccountDepositOverviewHtml,
+          transactionHistoryHtml: history,
+          transactionQueryAccount: {
+            optionCount: 3,
+            value: value!,
+            label: label!,
+          },
+        },
+        now,
+      ),
+    FirstbankProtocolError,
+    "選定帳戶與頁面帳戶有明確衝突時必須拒絕",
+  );
+}
+assert.throws(
+  () =>
+    parseFirstbankData(
+      {
+        depositOverviewHtml,
+        transactionHistoryHtml: transactionHistoryHtml.replace(
+          accountNumber,
+          "667788990011",
+        ),
+      },
+      now,
+    ),
+  FirstbankProtocolError,
+  "錯誤帳號不能因只有一個存款帳戶而被忽略",
+);
+assert.throws(
+  () =>
+    parseFirstbankData(
+      {
+        transactionHistoryHtml: transactionHistoryWithoutPageAccount,
+        transactionQueryAccount: {
+          optionCount: 2,
+          value: accountNumber,
+          label: "",
+        },
+      },
+      now,
+    ),
+  (error: unknown) => {
+    assert.ok(error instanceof FirstbankProtocolError);
+    assert.deepEqual(error.transactionAccountDiagnostics, {
+      depositAccountCount: 0,
+      pageAccountIdentityPresent: false,
+      selectedAccountIdentityPresent: true,
+      selectedAccountUniqueExactMatch: false,
+      strategy: "no-deposit-accounts",
+    });
+    assert.ok(!JSON.stringify(error).includes(accountNumber));
+    return true;
+  },
+  "零帳戶時的診斷不得包含實際帳號",
+);
+assert.throws(
+  () =>
+    parseFirstbankData(
+      {
+        depositOverviewHtml: multiAccountDepositOverviewHtml.replace(
+          "<td>合成分行</td><td>iLEO 帳戶</td><td>112233445566",
+          `<td>合成分行</td><td>支票帳戶</td><td>${accountNumber}`,
+        ),
+        transactionHistoryHtml: transactionHistoryWithoutPageAccount,
+        transactionQueryAccount: {
+          optionCount: 3,
+          value: accountNumber,
+          label: "日常存款",
+        },
+      },
+      now,
+    ),
+  FirstbankProtocolError,
+  "選定帳戶對到多筆存款帳戶時，不得猜測其中一筆",
+);
 assert.equal(parsed.bankAccounts.length, 2);
 assert.equal(
   parsed.bankAccounts.find((account) => account.accountType === "savings")

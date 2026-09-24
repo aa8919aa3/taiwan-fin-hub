@@ -36,6 +36,11 @@ export function parseFirstbankConfig(config: unknown): FirstbankConfig {
 export type FirstbankPayloads = {
   depositOverviewHtml?: string;
   transactionHistoryHtml?: string;
+  transactionQueryAccount?: {
+    optionCount: number;
+    value: string;
+    label: string;
+  };
   cardBill?: unknown;
   cardUnbilled?: unknown;
   recentPayments?: unknown;
@@ -118,8 +123,25 @@ const SUPPORTED_CURRENCIES = new Set([
 ]);
 
 /** Provider HTML/JSON 變動時不得猜測欄位，交由同步流程顯示可重試的協定錯誤。 */
+export type FirstbankTransactionAccountDiagnostics = {
+  depositAccountCount: number;
+  pageAccountIdentityPresent: boolean;
+  selectedAccountIdentityPresent: boolean;
+  selectedAccountUniqueExactMatch: boolean;
+  strategy:
+    | "no-deposit-accounts"
+    | "page-identity"
+    | "query-identity"
+    | "single-deposit-account"
+    | "ambiguous-no-identity"
+    | "query-identity-conflict";
+};
+
 export class FirstbankProtocolError extends Error {
-  constructor(message = "第一銀行回應格式已變更，暫時無法同步。") {
+  constructor(
+    message = "第一銀行回應格式已變更，暫時無法同步。",
+    readonly transactionAccountDiagnostics?: FirstbankTransactionAccountDiagnostics,
+  ) {
     super(message);
     this.name = "FirstbankProtocolError";
   }
@@ -185,6 +207,7 @@ export function parseFirstbankData(
     ? parseTransactionHistoryHtml(
         payloads.transactionHistoryHtml,
         deposits.accounts,
+        payloads.transactionQueryAccount,
       )
     : [];
   const cards = parseCreditCards(
@@ -418,6 +441,7 @@ function accountTypeFor(value: unknown): BankAccount["accountType"] {
 function parseTransactionHistoryHtml(
   html: unknown,
   accounts: DepositAccount[],
+  queryAccount?: FirstbankPayloads["transactionQueryAccount"],
 ): FirstbankData["bankTransactions"] {
   if (typeof html !== "string") {
     throw new FirstbankProtocolError("第一銀行交易明細格式已變更。");
@@ -426,6 +450,7 @@ function parseTransactionHistoryHtml(
   const rows = extractHtmlRows(html);
   const pageText = stripTags(html);
   const accountToken = findPageAccountIdentity(pageText);
+  const queryAccountIdentity = findQueryAccountIdentity(queryAccount);
   const headers = rows
     .map((row, index) => {
       const header = parseTransactionHeader(row.cells);
@@ -454,14 +479,20 @@ function parseTransactionHistoryHtml(
       const parsed = parseTransactionRow(row.cells, current.header);
       if (!parsed) continue;
       const currency = parsed.currency || TWD;
-      const account = resolveTransactionAccount(
-        accountToken,
+      const account = resolveTransactionAccount({
+        pageToken: accountToken,
+        queryAccountIdentity,
         currency,
         accounts,
-      );
+      });
       if (!account) {
         throw new FirstbankProtocolError(
           "第一銀行交易明細找不到對應的存款帳戶。",
+          transactionAccountDiagnostics(
+            accounts,
+            accountToken,
+            queryAccountIdentity,
+          ),
         );
       }
       const identity = [
@@ -629,23 +660,92 @@ function parseTransactionRow(
   };
 }
 
-function resolveTransactionAccount(
-  token: string | undefined,
-  currency: string,
-  accounts: DepositAccount[],
+function findQueryAccountIdentity(
+  queryAccount: FirstbankPayloads["transactionQueryAccount"],
 ) {
-  if (accounts.length === 0) {
-    return undefined;
+  if (!queryAccount) return undefined;
+  const value = extractAccountIdentity(queryAccount.value)?.token;
+  const label = extractAccountIdentity(queryAccount.label)?.token;
+  if (
+    value &&
+    label &&
+    normalizeAccountIdentity(value) !== normalizeAccountIdentity(label)
+  ) {
+    return "conflict" as const;
   }
-  if (token) {
+  return value ?? label;
+}
+
+function transactionAccountDiagnostics(
+  accounts: DepositAccount[],
+  pageToken: string | undefined,
+  queryAccountIdentity: string | "conflict" | undefined,
+): FirstbankTransactionAccountDiagnostics {
+  const selectedAccountUniqueExactMatch =
+    typeof queryAccountIdentity === "string" &&
+    accounts.filter(
+      (account) =>
+        account.accountKey === normalizeAccountIdentity(queryAccountIdentity),
+    ).length === 1;
+  return {
+    depositAccountCount: accounts.length,
+    pageAccountIdentityPresent: Boolean(pageToken),
+    selectedAccountIdentityPresent: queryAccountIdentity !== undefined,
+    selectedAccountUniqueExactMatch,
+    strategy:
+      accounts.length === 0
+        ? "no-deposit-accounts"
+        : queryAccountIdentity === "conflict"
+          ? "query-identity-conflict"
+          : pageToken
+            ? "page-identity"
+            : queryAccountIdentity
+              ? "query-identity"
+              : accounts.length === 1
+                ? "single-deposit-account"
+                : "ambiguous-no-identity",
+  };
+}
+
+function resolveTransactionAccount({
+  pageToken,
+  queryAccountIdentity,
+  currency,
+  accounts,
+}: {
+  pageToken: string | undefined;
+  queryAccountIdentity: string | "conflict" | undefined;
+  currency: string;
+  accounts: DepositAccount[];
+}) {
+  if (accounts.length === 0 || queryAccountIdentity === "conflict")
+    return undefined;
+  const matchToken = (token: string) => {
     const key = normalizeAccountIdentity(token);
-    const matching = accounts.find(
+    const currencyMatches = accounts.filter(
       (account) => account.accountKey === key && account.currency === currency,
     );
-    if (matching) return matching;
-    const sameToken = accounts.find((account) => account.accountKey === key);
-    if (sameToken) return sameToken;
+    if (currencyMatches.length === 1) return currencyMatches[0];
+    const tokenMatches = accounts.filter(
+      (account) => account.accountKey === key,
+    );
+    return tokenMatches.length === 1 ? tokenMatches[0] : undefined;
+  };
+  const pageAccount = pageToken ? matchToken(pageToken) : undefined;
+  const queryAccount =
+    typeof queryAccountIdentity === "string"
+      ? matchToken(queryAccountIdentity)
+      : undefined;
+  if (pageToken) {
+    if (!pageAccount) return undefined;
+    if (
+      queryAccountIdentity &&
+      (!queryAccount || queryAccount.sourceId !== pageAccount.sourceId)
+    )
+      return undefined;
+    return pageAccount;
   }
+  if (queryAccountIdentity) return queryAccount;
   return accounts.length === 1 ? accounts[0] : undefined;
 }
 
