@@ -195,6 +195,14 @@ export type { HncbConfig, HncbData, HncbPayloads } from "./hncb";
 import { hncbConfigSchema } from "./hncb";
 
 export {
+  rakutenConfigSchema,
+  parseRakutenConfig,
+  parseRakutenData,
+} from "./rakuten";
+export type { RakutenConfig, RakutenData, RakutenPayloads } from "./rakuten";
+import { rakutenConfigSchema } from "./rakuten";
+
+export {
   KGIBANK_CAPTCHA_DIGIT_COUNT,
   KgibankProtocolError,
   kgibankAccountSourceId,
@@ -219,6 +227,8 @@ export type {
 export {
   createMegabankConnector,
   MegabankConnectionError,
+  MegabankOtpInvalidError,
+  MegabankOtpRequiredError,
   MegabankProtocolError,
   MegabankVerificationRequiredError,
   prepareMegabankCaptcha,
@@ -836,6 +846,7 @@ export const connectorConfigSchemas = {
   nextbank: nextbankConfigSchema,
   firstbank: firstbankConfigSchema,
   hncb: hncbConfigSchema,
+  rakuten: rakutenConfigSchema,
   kgibank: kgibankConfigSchema,
   megabank: megabankConfigSchema,
 } satisfies Record<ConnectorId, z.ZodTypeAny>;
